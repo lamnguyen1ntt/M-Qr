@@ -1,6 +1,6 @@
 import express from "express";
 import cors from "cors";
-import { Pool } from "pg";
+import { sql } from "@vercel/postgres";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -10,12 +10,6 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
-// Initialize Postgres Database Connection
-const pool = new Pool({
-  connectionString: process.env.POSTGRES_URL,
-  ssl: { rejectUnauthorized: false },
-});
-
 async function initDB() {
   if (!process.env.POSTGRES_URL) {
     console.warn("WARNING: POSTGRES_URL is not set.");
@@ -23,7 +17,7 @@ async function initDB() {
   }
   
   try {
-    await pool.query(`
+    await sql`
       CREATE TABLE IF NOT EXISTS qrs (
         id SERIAL PRIMARY KEY,
         name TEXT NOT NULL,
@@ -31,7 +25,9 @@ async function initDB() {
         status TEXT DEFAULT 'Đang chạy',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
+    `;
 
+    await sql`
       CREATE TABLE IF NOT EXISTS scans (
         id SERIAL PRIMARY KEY,
         qr_id INTEGER,
@@ -40,88 +36,103 @@ async function initDB() {
         user_agent TEXT,
         FOREIGN KEY (qr_id) REFERENCES qrs (id) ON DELETE CASCADE
       );
-    `);
+    `;
     console.log("Database initialized successfully");
+    return true;
   } catch (err) {
     console.error("Failed to initialize database:", err);
+    return false;
   }
 }
 
 // Invoke instantly so connection is ready for lambda
 // But also track promise to await it in endpoints
-const dbInitPromise = initDB();
+let dbInitPromise = initDB();
 
 // API Routes
   
 // Get all QRs with stats
 app.get("/api/qr", async (req, res) => {
   try {
-    await dbInitPromise;
-    const { start, end } = req.query;
-    const params: any[] = [];
-    
-    let queryStr = `
-      SELECT q.id, q.name, q.url, q.status, q.created_at, COUNT(s.id) as scans 
-      FROM qrs q 
-      LEFT JOIN (
-        SELECT id, qr_id FROM scans 
-        WHERE 1=1
-    `;
-
-    if (start && end) {
-      queryStr += ` AND timestamp >= $1 AND timestamp <= $2::timestamp + interval '1 day' - interval '1 second'`;
-      params.push(start, end);
+    const isReady = await dbInitPromise;
+    if (!process.env.POSTGRES_URL) {
+      return res.status(503).json({ error: "Chưa cấu hình POSTGRES_URL." });
     }
+    const { start, end } = req.query;
     
-    queryStr += `) s ON q.id = s.qr_id GROUP BY q.id, q.name, q.url, q.status, q.created_at ORDER BY q.created_at DESC`;
+    let result;
+    if (start && end) {
+      result = await sql`
+        SELECT q.id, q.name, q.url, q.status, q.created_at, COUNT(s.id) as scans 
+        FROM qrs q 
+        LEFT JOIN scans s ON q.id = s.qr_id AND s.timestamp >= ${start as string} AND s.timestamp <= ${end as string}::timestamp + interval '1 day' - interval '1 second'
+        GROUP BY q.id, q.name, q.url, q.status, q.created_at 
+        ORDER BY q.created_at DESC
+      `;
+    } else {
+      result = await sql`
+        SELECT q.id, q.name, q.url, q.status, q.created_at, COUNT(s.id) as scans 
+        FROM qrs q 
+        LEFT JOIN scans s ON q.id = s.qr_id
+        GROUP BY q.id, q.name, q.url, q.status, q.created_at 
+        ORDER BY q.created_at DESC
+      `;
+    }
 
-    const result = await pool.query(queryStr, params);
     res.json(result.rows);
-  } catch (err) {
+  } catch (err: any) {
     console.error(err);
-    res.status(500).json({ error: "Internal Server Error" });
+    res.status(500).json({ error: err.message || "Internal Server Error" });
   }
 });
 
 // Get stats
 app.get("/api/stats", async (req, res) => {
   try {
+    const isReady = await dbInitPromise;
+    if (!process.env.POSTGRES_URL) {
+      return res.status(503).json({ error: "Chưa cấu hình POSTGRES_URL." });
+    }
     const { start, end } = req.query;
     
-    let dateFilterStr = "";
-    const params: any[] = [];
+    const runningQRsResult = await sql`SELECT COUNT(*) as count FROM qrs WHERE status = 'Đang chạy'`;
+    const runningQRs = parseInt(runningQRsResult.rows[0].count as string);
     
+    let totalScansResult;
     if (start && end) {
-      dateFilterStr = `WHERE timestamp >= $1 AND timestamp <= $2::timestamp + interval '1 day' - interval '1 second'`;
-      params.push(start, end);
+      totalScansResult = await sql`SELECT COUNT(*) as count FROM scans WHERE timestamp >= ${start as string} AND timestamp <= ${end as string}::timestamp + interval '1 day' - interval '1 second'`;
+    } else {
+      totalScansResult = await sql`SELECT COUNT(*) as count FROM scans`;
     }
-    
-    const runningQRsResult = await pool.query("SELECT COUNT(*) as count FROM qrs WHERE status = 'Đang chạy'");
-    const runningQRs = parseInt(runningQRsResult.rows[0].count);
-    
-    const totalScansQuery = `SELECT COUNT(*) as count FROM scans ${dateFilterStr}`;
-    const totalScansResult = await pool.query(totalScansQuery, params);
-    const totalScans = parseInt(totalScansResult.rows[0].count);
+    const totalScans = parseInt(totalScansResult.rows[0].count as string);
     
     // scans today
-    const scansTodayResult = await pool.query("SELECT COUNT(*) as count FROM scans WHERE DATE(timestamp) = CURRENT_DATE");
-    const scansToday = parseInt(scansTodayResult.rows[0].count);
+    const scansTodayResult = await sql`SELECT COUNT(*) as count FROM scans WHERE DATE(timestamp) = CURRENT_DATE`;
+    const scansToday = parseInt(scansTodayResult.rows[0].count as string);
     
     // scans this week
-    const scansWeekResult = await pool.query("SELECT COUNT(*) as count FROM scans WHERE timestamp >= CURRENT_DATE - interval '7 days'");
-    const scansWeek = parseInt(scansWeekResult.rows[0].count);
+    const scansWeekResult = await sql`SELECT COUNT(*) as count FROM scans WHERE timestamp >= CURRENT_DATE - interval '7 days'`;
+    const scansWeek = parseInt(scansWeekResult.rows[0].count as string);
 
-    let trendDateFilter = dateFilterStr ? dateFilterStr : "WHERE timestamp >= CURRENT_DATE - interval '7 days'";
-    
     // trend for chart
-    const trendQuery = `
-      SELECT DATE(timestamp) as date, COUNT(*) as count 
-      FROM scans 
-      ${trendDateFilter}
-      GROUP BY DATE(timestamp)
-      ORDER BY date ASC
-    `;
-    const trendResult = await pool.query(trendQuery, params);
+    let trendResult;
+    if (start && end) {
+      trendResult = await sql`
+        SELECT DATE(timestamp) as date, COUNT(*) as count 
+        FROM scans 
+        WHERE timestamp >= ${start as string} AND timestamp <= ${end as string}::timestamp + interval '1 day' - interval '1 second'
+        GROUP BY DATE(timestamp)
+        ORDER BY date ASC
+      `;
+    } else {
+      trendResult = await sql`
+        SELECT DATE(timestamp) as date, COUNT(*) as count 
+        FROM scans 
+        WHERE timestamp >= CURRENT_DATE - interval '7 days'
+        GROUP BY DATE(timestamp)
+        ORDER BY date ASC
+      `;
+    }
 
     res.json({
       runningQRs,
@@ -130,33 +141,35 @@ app.get("/api/stats", async (req, res) => {
       scansWeek,
       trend: trendResult.rows
     });
-  } catch (err) {
+  } catch (err: any) {
     console.error(err);
-    res.status(500).json({ error: "Internal Server Error" });
+    res.status(500).json({ error: err.message || "Internal Server Error" });
   }
 });
 
 // Create QR
 app.post("/api/qr", async (req, res) => {
   try {
-    await dbInitPromise;
+    const isReady = await dbInitPromise;
+    if (!process.env.POSTGRES_URL) {
+      return res.status(503).json({ error: "Chưa cấu hình POSTGRES_URL. Vui lòng thêm biến môi trường POSTGRES_URL vào AI Studio hoặc Vercel." });
+    }
     const { name, url } = req.body;
     if (!name || !url) {
       return res.status(400).json({ error: "Thieu name hoac url" });
     }
     
-    const insertResult = await pool.query(
-      'INSERT INTO qrs (name, url) VALUES ($1, $2) RETURNING id',
-      [name, url]
-    );
+    const insertResult = await sql`
+      INSERT INTO qrs (name, url) VALUES (${name}, ${url}) RETURNING id
+    `;
     
     const qrId = insertResult.rows[0].id;
     
-    const qrResult = await pool.query(`
+    const qrResult = await sql`
       SELECT q.id, q.name, q.url, q.status, q.created_at, 0 as scans 
       FROM qrs q 
-      WHERE id = $1
-    `, [qrId]);
+      WHERE id = ${qrId}
+    `;
     
     res.status(201).json(qrResult.rows[0]);
   } catch (err: any) {
@@ -169,50 +182,65 @@ app.post("/api/qr", async (req, res) => {
 // Update QR
 app.put("/api/qr/:id", async (req, res) => {
   try {
+    const isReady = await dbInitPromise;
+    if (!process.env.POSTGRES_URL) {
+      return res.status(503).json({ error: "Chưa cấu hình POSTGRES_URL." });
+    }
     const { id } = req.params;
     const { name, url, status } = req.body;
     
-    await pool.query(`
-      UPDATE qrs 
-      SET name = COALESCE($1, name), 
-          url = COALESCE($2, url), 
-          status = COALESCE($3, status)
-      WHERE id = $4
-    `, [name, url, status, id]);
+    if (name && url && status) {
+       await sql`
+        UPDATE qrs 
+        SET name = ${name}, url = ${url}, status = ${status}
+        WHERE id = ${id}
+      `;
+    } else if (status) {
+       await sql`UPDATE qrs SET status = ${status} WHERE id = ${id}`;
+    } else if (name && url) {
+       await sql`UPDATE qrs SET name = ${name}, url = ${url} WHERE id = ${id}`;
+    }
     
-    const qrResult = await pool.query(`
+    const qrResult = await sql`
       SELECT q.id, q.name, q.url, q.status, q.created_at, COUNT(s.id) as scans 
       FROM qrs q 
       LEFT JOIN scans s ON q.id = s.qr_id 
-      WHERE q.id = $1 
+      WHERE q.id = ${id}
       GROUP BY q.id, q.name, q.url, q.status, q.created_at
-    `, [id]);
+    `;
     
     res.json(qrResult.rows[0] || {});
-  } catch (err) {
+  } catch (err: any) {
     console.error(err);
-    res.status(500).json({ error: "Internal Server Error" });
+    res.status(500).json({ error: err.message || "Internal Server Error" });
   }
 });
 
 // Delete QR
 app.delete("/api/qr/:id", async (req, res) => {
   try {
+    const isReady = await dbInitPromise;
+    if (!process.env.POSTGRES_URL) {
+      return res.status(503).json({ error: "Chưa cấu hình POSTGRES_URL." });
+    }
     const { id } = req.params;
-    await pool.query('DELETE FROM qrs WHERE id = $1', [id]);
+    await sql`DELETE FROM qrs WHERE id = ${id}`;
     res.json({ message: "Deleted successfully" });
-  } catch (err) {
+  } catch (err: any) {
     console.error(err);
-    res.status(500).json({ error: "Internal Server Error" });
+    res.status(500).json({ error: err.message || "Internal Server Error" });
   }
 });
 
 // Redirect endpoint for QR code tracking
 app.get("/go/:id", async (req, res) => {
   try {
-    await dbInitPromise;
+    const isReady = await dbInitPromise;
+    if (!process.env.POSTGRES_URL) {
+      return res.status(503).send("Chưa cấu hình POSTGRES_URL.");
+    }
     const { id } = req.params;
-    const qrResult = await pool.query('SELECT url, status FROM qrs WHERE id = $1', [id]);
+    const qrResult = await sql`SELECT url, status FROM qrs WHERE id = ${id}`;
     const qr = qrResult.rows[0];
     
     if (!qr) {
@@ -227,15 +255,14 @@ app.get("/go/:id", async (req, res) => {
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
     const userAgent = req.headers['user-agent'] || '';
     
-    await pool.query(
-      'INSERT INTO scans (qr_id, ip_address, user_agent) VALUES ($1, $2, $3)',
-      [id, String(ip), String(userAgent)]
-    );
+    await sql`
+      INSERT INTO scans (qr_id, ip_address, user_agent) VALUES (${id}, ${String(ip)}, ${String(userAgent)})
+    `;
     
     // Redirect
     const destUrl = qr.url.startsWith('http') ? qr.url : `https://${qr.url}`;
     res.redirect(302, destUrl);
-  } catch (err) {
+  } catch (err: any) {
     console.error(err);
     res.status(500).send("Internal Server Error");
   }

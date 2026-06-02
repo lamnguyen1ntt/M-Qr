@@ -508,7 +508,7 @@ export default function App() {
                 <div className="flex flex-col gap-2">
                   <label className="text-[13px] font-semibold text-slate-700">Link đích (Destination URL)</label>
                   <input 
-                    type="url" 
+                    type="text" 
                     required
                     value={newQrUrl}
                     onChange={(e) => setNewQrUrl(e.target.value)}
@@ -598,7 +598,7 @@ export default function App() {
                     <div className="flex flex-col gap-2">
                       <label className="text-[13px] font-semibold text-slate-700">Link đích hiện tại</label>
                       <input 
-                        type="url" 
+                        type="text" 
                         required
                         value={editQrUrl}
                         onChange={(e) => setEditQrUrl(e.target.value)}

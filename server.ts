@@ -2,37 +2,50 @@ import express from "express";
 import cors from "cors";
 import path from "path";
 import { createServer as createViteServer } from "vite";
-import Database from "better-sqlite3";
-import fs from "fs";
+import { Pool } from "pg";
+import dotenv from "dotenv";
 
-// Initialize SQLite database
-const dbDir = path.join(process.cwd(), "db");
-if (!fs.existsSync(dbDir)) {
-  fs.mkdirSync(dbDir);
+dotenv.config();
+
+// Initialize Postgres Database Connection
+const pool = new Pool({
+  connectionString: process.env.POSTGRES_URL,
+});
+
+async function initDB() {
+  if (!process.env.POSTGRES_URL) {
+    console.warn("WARNING: POSTGRES_URL is not set. Database operations will fail. Please add POSTGRES_URL to your .env file or Vercel Environment Variables.");
+    return;
+  }
+  
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS qrs (
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL,
+        url TEXT NOT NULL,
+        status TEXT DEFAULT 'Đang chạy',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS scans (
+        id SERIAL PRIMARY KEY,
+        qr_id INTEGER,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        ip_address TEXT,
+        user_agent TEXT,
+        FOREIGN KEY (qr_id) REFERENCES qrs (id) ON DELETE CASCADE
+      );
+    `);
+    console.log("Database initialized successfully");
+  } catch (err) {
+    console.error("Failed to initialize database:", err);
+  }
 }
-const db = new Database(path.join(dbDir, "qr_database.sqlite"));
-
-// Create tables
-db.exec(`
-  CREATE TABLE IF NOT EXISTS qrs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    url TEXT NOT NULL,
-    status TEXT DEFAULT 'Đang chạy',
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS scans (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    qr_id INTEGER,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-    ip_address TEXT,
-    user_agent TEXT,
-    FOREIGN KEY (qr_id) REFERENCES qrs (id) ON DELETE CASCADE
-  );
-`);
 
 async function startServer() {
+  await initDB();
+  
   const app = express();
   const PORT = 3000;
 
@@ -42,25 +55,28 @@ async function startServer() {
   // API Routes
   
   // Get all QRs with stats
-  app.get("/api/qr", (req, res) => {
+  app.get("/api/qr", async (req, res) => {
     try {
       const { start, end } = req.query;
-      let dateFilter = "";
       const params: any[] = [];
       
+      let queryStr = `
+        SELECT q.id, q.name, q.url, q.status, q.created_at, COUNT(s.id) as scans 
+        FROM qrs q 
+        LEFT JOIN (
+          SELECT id, qr_id FROM scans 
+          WHERE 1=1
+      `;
+
       if (start && end) {
-        dateFilter = "AND s.timestamp >= ? AND s.timestamp <= ? || ' 23:59:59'";
+        queryStr += ` AND timestamp >= $1 AND timestamp <= $2::timestamp + interval '1 day' - interval '1 second'`;
         params.push(start, end);
       }
+      
+      queryStr += `) s ON q.id = s.qr_id GROUP BY q.id, q.name, q.url, q.status, q.created_at ORDER BY q.created_at DESC`;
 
-      const qrs = db.prepare(`
-        SELECT q.*, COUNT(s.id) as scans 
-        FROM qrs q 
-        LEFT JOIN scans s ON q.id = s.qr_id ${dateFilter}
-        GROUP BY q.id 
-        ORDER BY q.created_at DESC
-      `).all(...params);
-      res.json(qrs);
+      const result = await pool.query(queryStr, params);
+      res.json(result.rows);
     } catch (err) {
       console.error(err);
       res.status(500).json({ error: "Internal Server Error" });
@@ -68,51 +84,51 @@ async function startServer() {
   });
 
   // Get stats
-  app.get("/api/stats", (req, res) => {
+  app.get("/api/stats", async (req, res) => {
     try {
       const { start, end } = req.query;
       
-      let dateFilter = "";
+      let dateFilterStr = "";
       const params: any[] = [];
       
       if (start && end) {
-        dateFilter = "WHERE timestamp >= ? AND timestamp <= ? || ' 23:59:59'";
+        dateFilterStr = `WHERE timestamp >= $1 AND timestamp <= $2::timestamp + interval '1 day' - interval '1 second'`;
         params.push(start, end);
       }
       
-      const runningQRsParams = [];
-      let runningFilter = "";
-      if (start && end) {
-         // for Qrs we just return current running count, it doesn't strictly depend on scan dates, but let's just return total running.
-      }
+      const runningQRsResult = await pool.query("SELECT COUNT(*) as count FROM qrs WHERE status = 'Đang chạy'");
+      const runningQRs = parseInt(runningQRsResult.rows[0].count);
       
-      const runningQRs = (db.prepare("SELECT COUNT(*) as count FROM qrs WHERE status = 'Đang chạy'").get() as any).count;
-      
-      const totalScansQuery = `SELECT COUNT(*) as count FROM scans ${dateFilter}`;
-      const totalScans = (db.prepare(totalScansQuery).get(...params) as any).count;
+      const totalScansQuery = `SELECT COUNT(*) as count FROM scans ${dateFilterStr}`;
+      const totalScansResult = await pool.query(totalScansQuery, params);
+      const totalScans = parseInt(totalScansResult.rows[0].count);
       
       // scans today
-      const scansToday = (db.prepare("SELECT COUNT(*) as count FROM scans WHERE date(timestamp) = date('now')").get() as any).count;
+      const scansTodayResult = await pool.query("SELECT COUNT(*) as count FROM scans WHERE DATE(timestamp) = CURRENT_DATE");
+      const scansToday = parseInt(scansTodayResult.rows[0].count);
       
       // scans this week
-      const scansWeek = (db.prepare("SELECT COUNT(*) as count FROM scans WHERE timestamp >= date('now', '-7 days')").get() as any).count;
+      const scansWeekResult = await pool.query("SELECT COUNT(*) as count FROM scans WHERE timestamp >= CURRENT_DATE - interval '7 days'");
+      const scansWeek = parseInt(scansWeekResult.rows[0].count);
 
+      let trendDateFilter = dateFilterStr ? dateFilterStr : "WHERE timestamp >= CURRENT_DATE - interval '7 days'";
+      
       // trend for chart
       const trendQuery = `
-        SELECT date(timestamp) as date, COUNT(*) as count 
+        SELECT DATE(timestamp) as date, COUNT(*) as count 
         FROM scans 
-        ${dateFilter ? dateFilter : "WHERE timestamp >= date('now', '-7 days')"}
-        GROUP BY date(timestamp)
+        ${trendDateFilter}
+        GROUP BY DATE(timestamp)
         ORDER BY date ASC
       `;
-      const trend = db.prepare(trendQuery).all(...params);
+      const trendResult = await pool.query(trendQuery, params);
 
       res.json({
         runningQRs,
         totalScans,
         scansToday,
         scansWeek,
-        trend
+        trend: trendResult.rows
       });
     } catch (err) {
       console.error(err);
@@ -121,73 +137,80 @@ async function startServer() {
   });
 
   // Create QR
-  app.post("/api/qr", (req, res) => {
+  app.post("/api/qr", async (req, res) => {
     try {
       const { name, url } = req.body;
       if (!name || !url) {
         return res.status(400).json({ error: "Thieu name hoac url" });
       }
       
-      const insert = db.prepare('INSERT INTO qrs (name, url) VALUES (?, ?)');
-      const result = insert.run(name, url);
+      const insertResult = await pool.query(
+        'INSERT INTO qrs (name, url) VALUES ($1, $2) RETURNING id',
+        [name, url]
+      );
       
-      const qr = db.prepare(`
-        SELECT q.*, 0 as scans 
+      const qrId = insertResult.rows[0].id;
+      
+      const qrResult = await pool.query(`
+        SELECT q.id, q.name, q.url, q.status, q.created_at, 0 as scans 
         FROM qrs q 
-        WHERE id = ?
-      `).get(result.lastInsertRowid);
+        WHERE id = $1
+      `, [qrId]);
       
-      res.status(201).json(qr);
+      res.status(201).json(qrResult.rows[0]);
     } catch (err) {
+      console.error(err);
       res.status(500).json({ error: "Internal Server Error" });
     }
   });
 
   // Update QR
-  app.put("/api/qr/:id", (req, res) => {
+  app.put("/api/qr/:id", async (req, res) => {
     try {
       const { id } = req.params;
       const { name, url, status } = req.body;
       
-      const update = db.prepare(`
+      await pool.query(`
         UPDATE qrs 
-        SET name = COALESCE(?, name), 
-            url = COALESCE(?, url), 
-            status = COALESCE(?, status)
-        WHERE id = ?
-      `);
-      update.run(name, url, status, id);
+        SET name = COALESCE($1, name), 
+            url = COALESCE($2, url), 
+            status = COALESCE($3, status)
+        WHERE id = $4
+      `, [name, url, status, id]);
       
-      const qr = db.prepare(`
-        SELECT q.*, COUNT(s.id) as scans 
+      const qrResult = await pool.query(`
+        SELECT q.id, q.name, q.url, q.status, q.created_at, COUNT(s.id) as scans 
         FROM qrs q 
         LEFT JOIN scans s ON q.id = s.qr_id 
-        WHERE q.id = ? 
-        GROUP BY q.id
-      `).get(id);
+        WHERE q.id = $1 
+        GROUP BY q.id, q.name, q.url, q.status, q.created_at
+      `, [id]);
       
-      res.json(qr);
+      res.json(qrResult.rows[0] || {});
     } catch (err) {
+      console.error(err);
       res.status(500).json({ error: "Internal Server Error" });
     }
   });
 
   // Delete QR
-  app.delete("/api/qr/:id", (req, res) => {
+  app.delete("/api/qr/:id", async (req, res) => {
     try {
       const { id } = req.params;
-      db.prepare('DELETE FROM qrs WHERE id = ?').run(id);
+      await pool.query('DELETE FROM qrs WHERE id = $1', [id]);
       res.json({ message: "Deleted successfully" });
     } catch (err) {
+      console.error(err);
       res.status(500).json({ error: "Internal Server Error" });
     }
   });
 
   // Redirect endpoint for QR code tracking
-  app.get("/go/:id", (req, res) => {
+  app.get("/go/:id", async (req, res) => {
     try {
       const { id } = req.params;
-      const qr = db.prepare('SELECT url, status FROM qrs WHERE id = ?').get(id) as any;
+      const qrResult = await pool.query('SELECT url, status FROM qrs WHERE id = $1', [id]);
+      const qr = qrResult.rows[0];
       
       if (!qr) {
         return res.status(404).send("QR Not Found");
@@ -201,7 +224,10 @@ async function startServer() {
       const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
       const userAgent = req.headers['user-agent'] || '';
       
-      db.prepare('INSERT INTO scans (qr_id, ip_address, user_agent) VALUES (?, ?, ?)').run(id, String(ip), String(userAgent));
+      await pool.query(
+        'INSERT INTO scans (qr_id, ip_address, user_agent) VALUES ($1, $2, $3)',
+        [id, String(ip), String(userAgent)]
+      );
       
       // Redirect
       const destUrl = qr.url.startsWith('http') ? qr.url : `https://${qr.url}`;

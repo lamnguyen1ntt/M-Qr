@@ -48,13 +48,15 @@ async function initDB() {
 }
 
 // Invoke instantly so connection is ready for lambda
-initDB();
+// But also track promise to await it in endpoints
+const dbInitPromise = initDB();
 
 // API Routes
   
 // Get all QRs with stats
 app.get("/api/qr", async (req, res) => {
   try {
+    await dbInitPromise;
     const { start, end } = req.query;
     const params: any[] = [];
     
@@ -137,6 +139,7 @@ app.get("/api/stats", async (req, res) => {
 // Create QR
 app.post("/api/qr", async (req, res) => {
   try {
+    await dbInitPromise;
     const { name, url } = req.body;
     if (!name || !url) {
       return res.status(400).json({ error: "Thieu name hoac url" });
@@ -156,9 +159,10 @@ app.post("/api/qr", async (req, res) => {
     `, [qrId]);
     
     res.status(201).json(qrResult.rows[0]);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Internal Server Error" });
+  } catch (err: any) {
+    const errString = typeof err === 'object' ? JSON.stringify(err, Object.getOwnPropertyNames(err)) : String(err);
+    console.error("Lỗi khi tạo QR:", err);
+    res.status(500).json({ error: errString });
   }
 });
 
@@ -206,6 +210,7 @@ app.delete("/api/qr/:id", async (req, res) => {
 // Redirect endpoint for QR code tracking
 app.get("/go/:id", async (req, res) => {
   try {
+    await dbInitPromise;
     const { id } = req.params;
     const qrResult = await pool.query('SELECT url, status FROM qrs WHERE id = $1', [id]);
     const qr = qrResult.rows[0];

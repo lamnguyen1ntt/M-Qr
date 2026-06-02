@@ -95,9 +95,13 @@ export default function App() {
         setNewQrName('');
         setNewQrUrl('');
         setActiveTab('my-qrs');
+      } else {
+        const errorData = await res.json().catch(() => null);
+        alert(`Lỗi khi tạo mã: ${errorData?.error || res.statusText || 'Unknown error'}`);
       }
-    } catch (error) {
+    } catch (error: any) {
       console.error("Failed to create QR:", error);
+      alert(`Lỗi khi kết nối: ${error.message}`);
     }
   };
 
